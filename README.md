@@ -1,12 +1,12 @@
 # Unity Fullscreen Game View
 
-> Open Unity's Game View in true fullscreen mode - topmost, taskbar hidden, single hotkey. Test your game exactly as it appears in a build, without leaving the editor.
+> Open Unity Game View in true fullscreen mode topmost, taskbar hidden, single hotkey. Test your game exactly as it appears in a build, without leaving the editor.
 
 ![Demo](docs/demo.gif)
 
 ## Why?
 
-Unity's built-in "Maximize on Play" doesn't actually go fullscreen - the taskbar, window borders, and editor chrome stay visible. This tool fixes that with a single editor script.
+Unity built-in "Maximize on Play" doesn't actually go fullscreen the taskbar, window borders, and editor chrome stay visible. This tool fixes that with a single editor script.
 
 ## Features
 
