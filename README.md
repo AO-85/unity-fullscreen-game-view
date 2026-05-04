@@ -49,6 +49,12 @@ Press once to enter fullscreen, press again to exit.
 
 Uses reflection to instantiate Unity's internal `UnityEditor.GameView` as a borderless popup, then calls Win32 `SetWindowPos` with `HWND_TOPMOST` to keep it above the taskbar and all other windows.
 
+## Support
+
+If this tool saved you time, consider buying me a coffee ☕
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/ao85)
+
 ## License
 
 [MIT](LICENSE) - free for personal and commercial use.
