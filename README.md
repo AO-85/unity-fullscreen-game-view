@@ -1,21 +1,21 @@
 # Unity Fullscreen Game View
 
-> Open Unity Game View in true fullscreen mode topmost, taskbar hidden, single hotkey. Test your game exactly as it appears in a build, without leaving the editor.
+> Open Unity Game View in true fullscreen on the monitor your mouse is on, pinned above everything, taskbar hidden. One key. Test your game exactly as it looks in a build, without leaving the editor.
 
 ![Demo](docs/demo.gif)
 
 ## Why?
 
-Unity built-in "Maximize on Play" doesn't actually go fullscreen the taskbar, window borders, and editor chrome stay visible. This tool fixes that with a single editor script.
+Unity's built-in "Maximize on Play" doesn't actually go fullscreen the taskbar stays visible, the Game View toolbar is still there, and you're still looking at your game inside a window. This is a single editor script that fixes that.
 
 ## Features
 
-- ✅ True fullscreen Game View (topmost window, above all others)
-- ✅ Automatically hides the Windows taskbar
-- ✅ Toggle on/off with `Ctrl + Shift + Alt + X`
-- ✅ Auto-restores taskbar on editor quit or recompile
+- ✅ True fullscreen Game View borderless, no toolbar, pinned above all other windows
+- ✅ Opens on the monitor your mouse cursor is on, not always monitor 1
+- ✅ Hides the Windows taskbar, including secondary taskbars on multi-monitor setups
+- ✅ F11 by default rebindable in Edit → Shortcuts like any other Unity shortcut
+- ✅ Survives script recompiles, and restores the taskbar even if the editor crashes
 - ✅ Single file, zero dependencies
-- ✅ MIT licensed - use in commercial projects
 
 ## Installation
 
@@ -34,10 +34,10 @@ Then copy `Assets/Editor/FullscreenGameView.cs` into your project.
 
 Enter Play Mode, then:
 
-- **Hotkey:** `Ctrl + Shift + Alt + X`
+- **Hotkey:** `F11`
 - **Menu:** `Window → Toggle Fullscreen Game View`
 
-Press once to enter fullscreen, press again to exit.
+Press once to go fullscreen, press again to come back. Works in both Play Mode and Edit Mode.
 
 ## Requirements
 
