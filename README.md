@@ -1,4 +1,4 @@
-# Unity Fullscreen Game View
+# Unity Fullscreen Game View Windows, Linux, macOS
 
 > Open Unity Game View in true fullscreen on the monitor your mouse is on, pinned above everything, taskbar hidden. One key. Test your game exactly as it looks in a build, without leaving the editor.
 
