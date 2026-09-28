@@ -1,7 +1,3 @@
-// Unity Fullscreen Game View
-// https://github.com/AO-85/unity-fullscreen-game-view
-// MIT License
-
 #if UNITY_EDITOR
 using System;
 using System.Reflection;
@@ -12,26 +8,15 @@ using UnityEngine;
 
 namespace FullscreenGameViewTool
 {
-    /// <summary>
-    /// Opens Unity's Game View as a borderless fullscreen window on the monitor
-    /// under the mouse cursor. Default shortcut: F11 (rebindable in Edit > Shortcuts).
-    /// </summary>
     public static class FullscreenGameView
     {
         private const string MenuPath = "Window/Toggle Fullscreen Game View";
-
-        // Identifies our window among any other Game Views. Never visible: the popup has no
-        // title bar. Looking the window up this way avoids instance-id APIs, which were
-        // renamed in Unity 6.4.
         private const string WindowMarker = "FullscreenGameView.Instance";
-
-        // EditorPrefs survives an editor restart, so we can recover the taskbar after a crash.
         private const string TaskbarHiddenKey = "FullscreenGameView.TaskbarHidden";
 
         private static readonly Type GameViewType =
             typeof(Editor).Assembly.GetType("UnityEditor.GameView");
 
-        // "showToolbar" is an internal property in most versions, a field in some.
         private static readonly PropertyInfo ShowToolbarProperty =
             GameViewType?.GetProperty("showToolbar",
                 BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
@@ -40,9 +25,9 @@ namespace FullscreenGameViewTool
             GameViewType?.GetField("showToolbar",
                 BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
 
-        // ------------------------------------------------------------------
-        // Entry points
-        // ------------------------------------------------------------------
+        private static double _lastToggleTime;
+        private static bool _togglePending;
+        private static IntPtr _editorWindowBefore = IntPtr.Zero;
 
         [MenuItem(MenuPath, false, 1)]
         public static void ToggleFromMenu() => RequestToggle();
@@ -50,19 +35,10 @@ namespace FullscreenGameViewTool
         [Shortcut("Window/Toggle Fullscreen Game View", KeyCode.F11)]
         private static void ToggleFromShortcut() => RequestToggle();
 
-        private static double _lastToggleTime;
-        private static bool _togglePending;
-
-        /// <summary>
-        /// Debounces the request and runs it on the next editor tick. Opening or closing an
-        /// EditorWindow from inside GUI event processing can throw and silently abort, which
-        /// is why nothing is done inline here.
-        /// </summary>
         public static void RequestToggle()
         {
-            // Two paths can deliver the same keystroke (the Shortcut Manager and the global
-            // event hook below). Without this guard they would toggle twice and cancel out.
             var now = EditorApplication.timeSinceStartup;
+
             if (_togglePending || now - _lastToggleTime < 0.25)
                 return;
 
@@ -84,12 +60,6 @@ namespace FullscreenGameViewTool
                 OpenFullscreen();
         }
 
-        /// <summary>
-        /// The Shortcut Manager only sees a keystroke once the focused window forwards it,
-        /// and in Play Mode the Game View forwards unmodified keys straight to the running
-        /// game instead. This hook sits on EditorApplication's internal global event handler,
-        /// which receives the event first and from every editor window.
-        /// </summary>
         private static void HookGlobalKeyHandler()
         {
             var field = typeof(EditorApplication).GetField("globalEventHandler",
@@ -97,15 +67,14 @@ namespace FullscreenGameViewTool
 
             if (field == null)
             {
-                // Not fatal: the Shortcut Manager binding and the menu item still work.
                 Debug.LogWarning("[FullscreenGameView] Global key hook unavailable on this " +
-                                 "Unity version. F11 may not respond while in Play Mode — " +
+                                 "Unity version. F11 may not respond while in Play Mode - " +
                                  "use the Window menu or bind a shortcut with modifiers.");
                 return;
             }
 
             var handler = (EditorApplication.CallbackFunction)field.GetValue(null);
-            handler -= OnGlobalKeyEvent;   // domain reloads can leave a stale subscription
+            handler -= OnGlobalKeyEvent;
             handler += OnGlobalKeyEvent;
             field.SetValue(null, handler);
         }
@@ -121,10 +90,6 @@ namespace FullscreenGameViewTool
             RequestToggle();
         }
 
-        // ------------------------------------------------------------------
-        // Open / close
-        // ------------------------------------------------------------------
-
         private static void OpenFullscreen()
         {
             if (GameViewType == null)
@@ -135,7 +100,8 @@ namespace FullscreenGameViewTool
             }
 
             var bounds = Platform.GetFullscreenBounds();
-            var foregroundBefore = Platform.GetForegroundWindowHandle();
+
+            _editorWindowBefore = Platform.GetForegroundWindowHandle();
 
             var window = (EditorWindow)ScriptableObject.CreateInstance(GameViewType);
 
@@ -150,17 +116,12 @@ namespace FullscreenGameViewTool
             window.ShowPopup();
             window.position = bounds;
             window.Focus();
-
-            // The popup has no title bar, so this text is never drawn — it is purely a marker
-            // that lets us find this exact window again after a script recompile.
             window.titleContent = new GUIContent(WindowMarker);
 
             Platform.SetTaskbarVisible(false);
             EditorPrefs.SetBool(TaskbarHiddenKey, true);
 
-            // The native window does not exist until Unity has pumped a frame, and how many
-            // frames that takes varies — especially in Play Mode. Retry instead of guessing.
-            BeginTopmostRetry(bounds, foregroundBefore);
+            BeginTopmostRetry(bounds, _editorWindowBefore);
         }
 
         private static void BeginTopmostRetry(Rect bounds, IntPtr foregroundBefore)
@@ -188,23 +149,17 @@ namespace FullscreenGameViewTool
 
             Platform.SetTaskbarVisible(true);
             EditorPrefs.SetBool(TaskbarHiddenKey, false);
+
+            Platform.RestoreEditorFocus(_editorWindowBefore);
+            _editorWindowBefore = IntPtr.Zero;
         }
 
-        /// <summary>
-        /// Closes the fullscreen window (if any) and restores the taskbar.
-        /// Safe to call at any time.
-        /// </summary>
         public static void ForceRestore()
         {
             TryGetOpenWindow(out var window);
             CloseFullscreen(window);
         }
 
-        /// <summary>
-        /// Finds the window by its marker title rather than by instance id, so it still works
-        /// after a script recompile (static fields are reset, but the window itself survives)
-        /// and stays free of APIs that were renamed in newer Unity versions.
-        /// </summary>
         private static bool TryGetOpenWindow(out EditorWindow window)
         {
             window = null;
@@ -227,10 +182,6 @@ namespace FullscreenGameViewTool
             return false;
         }
 
-        // ------------------------------------------------------------------
-        // Safety nets
-        // ------------------------------------------------------------------
-
         [InitializeOnLoadMethod]
         private static void Initialize()
         {
@@ -239,8 +190,6 @@ namespace FullscreenGameViewTool
 
             HookGlobalKeyHandler();
 
-            // If the editor crashed or was killed while fullscreen was active, the taskbar
-            // is still hidden and no window exists. Put it back.
             if (EditorPrefs.GetBool(TaskbarHiddenKey, false) && !TryGetOpenWindow(out _))
             {
                 Platform.SetTaskbarVisible(true);
@@ -248,15 +197,9 @@ namespace FullscreenGameViewTool
             }
         }
 
-        // ==================================================================
-        // Platform layer
-        // ==================================================================
-
         private static class Platform
         {
 #if UNITY_EDITOR_WIN
-
-            // ---------------- Windows ----------------
 
             [StructLayout(LayoutKind.Sequential)]
             private struct POINT
@@ -301,6 +244,15 @@ namespace FullscreenGameViewTool
             private static extern IntPtr GetForegroundWindow();
 
             [DllImport("user32.dll")]
+            private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+            [DllImport("user32.dll")]
+            private static extern bool IsWindow(IntPtr hWnd);
+
+            [DllImport("user32.dll")]
+            private static extern bool IsWindowVisible(IntPtr hWnd);
+
+            [DllImport("user32.dll")]
             private static extern bool GetCursorPos(out POINT point);
 
             [DllImport("user32.dll")]
@@ -321,7 +273,6 @@ namespace FullscreenGameViewTool
 
             public static IntPtr GetForegroundWindowHandle() => GetForegroundWindow();
 
-            /// <summary>Bounds of the monitor the mouse cursor is currently on.</summary>
             public static Rect GetFullscreenBounds()
             {
                 if (GetCursorPos(out var cursor))
@@ -340,13 +291,10 @@ namespace FullscreenGameViewTool
                 return new Rect(0, 0, res.width, res.height);
             }
 
-            /// <summary>Returns true once the window has actually been pinned.</summary>
             public static bool TryMakeTopmost(Rect bounds, IntPtr foregroundBefore)
             {
                 var hwnd = GetForegroundWindow();
 
-                // If focus has not moved yet, this is still Unity's main window. Pinning that
-                // would leave the whole editor above everything — wait for the next frame.
                 if (hwnd == IntPtr.Zero || hwnd == foregroundBefore)
                     return false;
 
@@ -369,6 +317,33 @@ namespace FullscreenGameViewTool
                 _fullscreenHwnd = IntPtr.Zero;
             }
 
+            public static void RestoreEditorFocus(IntPtr preferred)
+            {
+                var hwnd = preferred;
+
+                if (hwnd == IntPtr.Zero || !IsWindow(hwnd) || !IsWindowVisible(hwnd))
+                    hwnd = GetMainWindowOfThisProcess();
+
+                if (hwnd != IntPtr.Zero)
+                    SetForegroundWindow(hwnd);
+            }
+
+            private static IntPtr GetMainWindowOfThisProcess()
+            {
+                try
+                {
+                    using (var process = System.Diagnostics.Process.GetCurrentProcess())
+                    {
+                        process.Refresh();
+                        return process.MainWindowHandle;
+                    }
+                }
+                catch
+                {
+                    return IntPtr.Zero;
+                }
+            }
+
             public static void SetTaskbarVisible(bool visible)
             {
                 var command = visible ? SW_SHOW : SW_HIDE;
@@ -377,7 +352,6 @@ namespace FullscreenGameViewTool
                 if (primary != IntPtr.Zero)
                     ShowWindow(primary, command);
 
-                // Windows creates one Shell_SecondaryTrayWnd per additional monitor.
                 var secondary = IntPtr.Zero;
                 while ((secondary = FindWindowEx(IntPtr.Zero, secondary,
                            "Shell_SecondaryTrayWnd", null)) != IntPtr.Zero)
@@ -387,11 +361,6 @@ namespace FullscreenGameViewTool
             }
 
 #elif UNITY_EDITOR_OSX
-
-            // ---------------- macOS ----------------
-            // The Dock can be auto-hidden through System Events, which is a normal,
-            // reversible user preference. Pinning a window above all others and reading
-            // per-monitor bounds both need a native plugin, so they are no-ops here.
 
             public static IntPtr GetForegroundWindowHandle() => IntPtr.Zero;
 
@@ -405,6 +374,11 @@ namespace FullscreenGameViewTool
 
             public static void ClearTopmost() { }
 
+            public static void RestoreEditorFocus(IntPtr preferred)
+            {
+                RunAppleScript("tell application id \\\"com.unity3d.UnityEditor5.x\\\" to activate");
+            }
+
             public static void SetTaskbarVisible(bool visible)
             {
                 var autohide = visible ? "false" : "true";
@@ -417,7 +391,8 @@ namespace FullscreenGameViewTool
             {
                 try
                 {
-                    var info = new System.Diagnostics.ProcessStartInfo("osascript", "-e \"" + script + "\"")
+                    var info = new System.Diagnostics.ProcessStartInfo(
+                        "osascript", "-e \"" + script + "\"")
                     {
                         UseShellExecute = false,
                         CreateNoWindow = true
@@ -426,15 +401,11 @@ namespace FullscreenGameViewTool
                 }
                 catch (Exception e)
                 {
-                    Debug.LogWarning("[FullscreenGameView] Could not toggle the Dock: " + e.Message);
+                    Debug.LogWarning("[FullscreenGameView] AppleScript call failed: " + e.Message);
                 }
             }
 
 #else
-
-            // ---------------- Linux / other ----------------
-            // Panel behaviour is desktop-environment specific and there is no portable API,
-            // so we make a best-effort attempt through wmctrl when it happens to be installed.
 
             public static IntPtr GetForegroundWindowHandle() => IntPtr.Zero;
 
@@ -455,6 +426,11 @@ namespace FullscreenGameViewTool
                 TryWmctrl("-r :ACTIVE: -b remove,above,fullscreen");
             }
 
+            public static void RestoreEditorFocus(IntPtr preferred)
+            {
+                TryWmctrl("-a Unity");
+            }
+
             public static void SetTaskbarVisible(bool visible) { }
 
             private static void TryWmctrl(string arguments)
@@ -470,8 +446,6 @@ namespace FullscreenGameViewTool
                 }
                 catch
                 {
-                    // wmctrl is not installed or this is Wayland — the window still opens,
-                    // it just will not be pinned above the panel.
                 }
             }
 
