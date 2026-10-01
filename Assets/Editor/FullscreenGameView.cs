@@ -1,5 +1,7 @@
 #if UNITY_EDITOR
 using System;
+using System.Collections.Generic;
+using System.Globalization;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using UnityEditor;
@@ -10,27 +12,34 @@ namespace FullscreenGameViewTool
 {
     public static class FullscreenGameView
     {
-        private const string MenuPath = "Window/Toggle Fullscreen Game View";
+        private const string ToggleMenuPath = "Window/Toggle Fullscreen Game View";
+        private const string RestoreMenuPath = "Window/Force Restore (Fullscreen Game View)";
+
         private const string WindowMarker = "FullscreenGameView.Instance";
-        private const string TaskbarHiddenKey = "FullscreenGameView.TaskbarHidden";
+        private const string ActiveKey = "FullscreenGameView.Active";
+        private const string RectKey = "FullscreenGameView.Rect";
+
+        private const float RectTolerance = 4f;
+        private const double WatchdogInterval = 0.3;
+        private const double WatchdogGrace = 2.0;
 
         private static readonly Type GameViewType =
             typeof(Editor).Assembly.GetType("UnityEditor.GameView");
 
-        private static readonly PropertyInfo ShowToolbarProperty =
-            GameViewType?.GetProperty("showToolbar",
-                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
-
-        private static readonly FieldInfo ShowToolbarField =
-            GameViewType?.GetField("showToolbar",
-                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+        private static readonly PropertyInfo ShowToolbarProperty = FindShowToolbarProperty();
+        private static readonly FieldInfo ShowToolbarField = FindShowToolbarField();
 
         private static double _lastToggleTime;
         private static bool _togglePending;
         private static IntPtr _editorWindowBefore = IntPtr.Zero;
+        private static double _lastWatchdogRun;
+        private static double _missingSince = -1;
 
-        [MenuItem(MenuPath, false, 1)]
+        [MenuItem(ToggleMenuPath, false, 1)]
         public static void ToggleFromMenu() => RequestToggle();
+
+        [MenuItem(RestoreMenuPath, false, 2)]
+        public static void ForceRestoreFromMenu() => ForceRestore();
 
         [Shortcut("Window/Toggle Fullscreen Game View", KeyCode.F11)]
         private static void ToggleFromShortcut() => RequestToggle();
@@ -54,10 +63,221 @@ namespace FullscreenGameViewTool
 
         public static void Toggle()
         {
-            if (TryGetOpenWindow(out var window))
-                CloseFullscreen(window);
+            var windows = FindFullscreenWindows();
+
+            if (windows.Count > 0)
+                CloseFullscreen(windows);
             else
                 OpenFullscreen();
+        }
+
+        public static void ForceRestore()
+        {
+            CloseFullscreen(FindFullscreenWindows());
+        }
+
+        private static void OpenFullscreen()
+        {
+            if (GameViewType == null)
+            {
+                Debug.LogError("[FullscreenGameView] UnityEditor.GameView not found. " +
+                               "This Unity version is not supported.");
+                return;
+            }
+
+            var bounds = Platform.GetFullscreenBounds();
+
+            _editorWindowBefore = Platform.GetForegroundWindowHandle();
+
+            var window = (EditorWindow)ScriptableObject.CreateInstance(GameViewType);
+
+            SetShowToolbar(window, false);
+
+            window.ShowPopup();
+            window.position = bounds;
+            window.Focus();
+
+            ApplyIdentity(window);
+
+            EditorPrefs.SetBool(ActiveKey, true);
+            SaveRect(window.position);
+
+            Platform.SetTaskbarVisible(false);
+
+            _missingSince = -1;
+
+            BeginTopmostRetry(bounds, _editorWindowBefore);
+        }
+
+        private static void CloseFullscreen(List<EditorWindow> windows)
+        {
+            Platform.ClearTopmost();
+
+            foreach (var window in windows)
+            {
+                if (window != null)
+                    window.Close();
+            }
+
+            Platform.SetTaskbarVisible(true);
+
+            EditorPrefs.SetBool(ActiveKey, false);
+            EditorPrefs.DeleteKey(RectKey);
+
+            _missingSince = -1;
+
+            Platform.RestoreEditorFocus(_editorWindowBefore);
+            _editorWindowBefore = IntPtr.Zero;
+        }
+
+        private static List<EditorWindow> FindFullscreenWindows()
+        {
+            var found = new List<EditorWindow>();
+
+            if (GameViewType == null)
+                return found;
+
+            var storedRect = default(Rect);
+            var active = EditorPrefs.GetBool(ActiveKey, false);
+            var hasStoredRect = active && TryLoadRect(out storedRect);
+
+            foreach (var candidate in Resources.FindObjectsOfTypeAll<EditorWindow>())
+            {
+                if (candidate == null || candidate.GetType() != GameViewType)
+                    continue;
+
+                var marked = candidate.titleContent != null &&
+                             candidate.titleContent.text == WindowMarker;
+
+                var matchesRect = hasStoredRect && RectsMatch(candidate.position, storedRect);
+
+                if (!marked && !matchesRect)
+                    continue;
+
+                if (!marked)
+                    ApplyIdentity(candidate);
+
+                found.Add(candidate);
+            }
+
+            return found;
+        }
+
+        private static void ApplyIdentity(EditorWindow window)
+        {
+            window.titleContent = new GUIContent(WindowMarker);
+            SetShowToolbar(window, false);
+            window.Repaint();
+        }
+
+        private static void SetShowToolbar(EditorWindow window, bool value)
+        {
+            if (ShowToolbarProperty != null)
+            {
+                ShowToolbarProperty.SetValue(window, value);
+                return;
+            }
+
+            if (ShowToolbarField != null)
+            {
+                ShowToolbarField.SetValue(window, value);
+                return;
+            }
+
+            Debug.LogWarning("[FullscreenGameView] Could not hide the Game View toolbar " +
+                             "on this Unity version. Everything else still works.");
+        }
+
+        private static PropertyInfo FindShowToolbarProperty()
+        {
+            for (var type = GameViewType; type != null; type = type.BaseType)
+            {
+                var property = type.GetProperty("showToolbar",
+                    BindingFlags.Instance | BindingFlags.NonPublic |
+                    BindingFlags.Public | BindingFlags.DeclaredOnly);
+
+                if (property != null && property.CanWrite)
+                    return property;
+            }
+
+            return null;
+        }
+
+        private static FieldInfo FindShowToolbarField()
+        {
+            string[] names = { "showToolbar", "m_ShowToolbar" };
+
+            for (var type = GameViewType; type != null; type = type.BaseType)
+            {
+                foreach (var name in names)
+                {
+                    var field = type.GetField(name,
+                        BindingFlags.Instance | BindingFlags.NonPublic |
+                        BindingFlags.Public | BindingFlags.DeclaredOnly);
+
+                    if (field != null && field.FieldType == typeof(bool))
+                        return field;
+                }
+            }
+
+            return null;
+        }
+
+        private static void SaveRect(Rect rect)
+        {
+            var value = string.Format(CultureInfo.InvariantCulture, "{0};{1};{2};{3}",
+                rect.x, rect.y, rect.width, rect.height);
+
+            EditorPrefs.SetString(RectKey, value);
+        }
+
+        private static bool TryLoadRect(out Rect rect)
+        {
+            rect = default;
+
+            var raw = EditorPrefs.GetString(RectKey, string.Empty);
+            if (string.IsNullOrEmpty(raw))
+                return false;
+
+            var parts = raw.Split(';');
+            if (parts.Length != 4)
+                return false;
+
+            var values = new float[4];
+
+            for (var i = 0; i < 4; i++)
+            {
+                if (!float.TryParse(parts[i], NumberStyles.Float,
+                        CultureInfo.InvariantCulture, out values[i]))
+                    return false;
+            }
+
+            rect = new Rect(values[0], values[1], values[2], values[3]);
+            return true;
+        }
+
+        private static bool RectsMatch(Rect a, Rect b)
+        {
+            return Mathf.Abs(a.x - b.x) <= RectTolerance &&
+                   Mathf.Abs(a.y - b.y) <= RectTolerance &&
+                   Mathf.Abs(a.width - b.width) <= RectTolerance &&
+                   Mathf.Abs(a.height - b.height) <= RectTolerance;
+        }
+
+        private static void BeginTopmostRetry(Rect bounds, IntPtr foregroundBefore)
+        {
+            var attempts = 0;
+            EditorApplication.CallbackFunction step = null;
+
+            step = () =>
+            {
+                attempts++;
+
+                if (Platform.TryMakeTopmost(bounds, foregroundBefore) || attempts >= 60)
+                    EditorApplication.update -= step;
+            };
+
+            EditorApplication.update += step;
         }
 
         private static void HookGlobalKeyHandler()
@@ -83,103 +303,65 @@ namespace FullscreenGameViewTool
         {
             var e = Event.current;
 
-            if (e == null || e.type != EventType.KeyDown || e.keyCode != KeyCode.F11)
+            if (e == null || e.type != EventType.KeyDown)
                 return;
 
-            e.Use();
-            RequestToggle();
-        }
-
-        private static void OpenFullscreen()
-        {
-            if (GameViewType == null)
+            if (e.keyCode == KeyCode.F11)
             {
-                Debug.LogError("[FullscreenGameView] UnityEditor.GameView not found. " +
-                               "This Unity version is not supported.");
+                e.Use();
+                RequestToggle();
                 return;
             }
 
-            var bounds = Platform.GetFullscreenBounds();
-
-            _editorWindowBefore = Platform.GetForegroundWindowHandle();
-
-            var window = (EditorWindow)ScriptableObject.CreateInstance(GameViewType);
-
-            if (ShowToolbarProperty != null && ShowToolbarProperty.CanWrite)
-                ShowToolbarProperty.SetValue(window, false);
-            else if (ShowToolbarField != null)
-                ShowToolbarField.SetValue(window, false);
-            else
-                Debug.LogWarning("[FullscreenGameView] Could not hide the Game View toolbar " +
-                                 "on this Unity version. Everything else still works.");
-
-            window.ShowPopup();
-            window.position = bounds;
-            window.Focus();
-            window.titleContent = new GUIContent(WindowMarker);
-
-            Platform.SetTaskbarVisible(false);
-            EditorPrefs.SetBool(TaskbarHiddenKey, true);
-
-            BeginTopmostRetry(bounds, _editorWindowBefore);
-        }
-
-        private static void BeginTopmostRetry(Rect bounds, IntPtr foregroundBefore)
-        {
-            var attempts = 0;
-            EditorApplication.CallbackFunction step = null;
-
-            step = () =>
+            if (e.keyCode == KeyCode.Escape &&
+                !EditorApplication.isPlaying &&
+                EditorPrefs.GetBool(ActiveKey, false))
             {
-                attempts++;
-
-                if (Platform.TryMakeTopmost(bounds, foregroundBefore) || attempts >= 60)
-                    EditorApplication.update -= step;
-            };
-
-            EditorApplication.update += step;
+                e.Use();
+                RequestToggle();
+            }
         }
 
-        private static void CloseFullscreen(EditorWindow window)
+        private static void Watchdog()
         {
+            var now = EditorApplication.timeSinceStartup;
+
+            if (now - _lastWatchdogRun < WatchdogInterval)
+                return;
+
+            _lastWatchdogRun = now;
+
+            if (!EditorPrefs.GetBool(ActiveKey, false))
+            {
+                _missingSince = -1;
+                return;
+            }
+
+            if (FindFullscreenWindows().Count > 0)
+            {
+                _missingSince = -1;
+                return;
+            }
+
+            if (_missingSince < 0)
+            {
+                _missingSince = now;
+                return;
+            }
+
+            if (now - _missingSince < WatchdogGrace)
+                return;
+
             Platform.ClearTopmost();
-
-            if (window != null)
-                window.Close();
-
             Platform.SetTaskbarVisible(true);
-            EditorPrefs.SetBool(TaskbarHiddenKey, false);
+
+            EditorPrefs.SetBool(ActiveKey, false);
+            EditorPrefs.DeleteKey(RectKey);
+
+            _missingSince = -1;
 
             Platform.RestoreEditorFocus(_editorWindowBefore);
             _editorWindowBefore = IntPtr.Zero;
-        }
-
-        public static void ForceRestore()
-        {
-            TryGetOpenWindow(out var window);
-            CloseFullscreen(window);
-        }
-
-        private static bool TryGetOpenWindow(out EditorWindow window)
-        {
-            window = null;
-
-            if (GameViewType == null)
-                return false;
-
-            foreach (var candidate in Resources.FindObjectsOfTypeAll<EditorWindow>())
-            {
-                if (candidate == null || candidate.GetType() != GameViewType)
-                    continue;
-
-                if (candidate.titleContent == null || candidate.titleContent.text != WindowMarker)
-                    continue;
-
-                window = candidate;
-                return true;
-            }
-
-            return false;
         }
 
         [InitializeOnLoadMethod]
@@ -188,13 +370,13 @@ namespace FullscreenGameViewTool
             EditorApplication.quitting -= ForceRestore;
             EditorApplication.quitting += ForceRestore;
 
+            EditorApplication.update -= Watchdog;
+            EditorApplication.update += Watchdog;
+
             HookGlobalKeyHandler();
 
-            if (EditorPrefs.GetBool(TaskbarHiddenKey, false) && !TryGetOpenWindow(out _))
-            {
-                Platform.SetTaskbarVisible(true);
-                EditorPrefs.SetBool(TaskbarHiddenKey, false);
-            }
+            _lastWatchdogRun = 0;
+            _missingSince = -1;
         }
 
         private static class Platform
@@ -313,7 +495,9 @@ namespace FullscreenGameViewTool
                 if (_fullscreenHwnd == IntPtr.Zero)
                     return;
 
-                SetWindowPos(_fullscreenHwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_SHOWWINDOW);
+                if (IsWindow(_fullscreenHwnd))
+                    SetWindowPos(_fullscreenHwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_SHOWWINDOW);
+
                 _fullscreenHwnd = IntPtr.Zero;
             }
 
@@ -374,34 +558,28 @@ namespace FullscreenGameViewTool
 
             public static void ClearTopmost() { }
 
-            public static void RestoreEditorFocus(IntPtr preferred)
-            {
-                RunAppleScript("tell application id \\\"com.unity3d.UnityEditor5.x\\\" to activate");
-            }
+            public static void RestoreEditorFocus(IntPtr preferred) { }
 
             public static void SetTaskbarVisible(bool visible)
             {
                 var autohide = visible ? "false" : "true";
-                RunAppleScript(
-                    "tell application \\\"System Events\\\" to tell dock preferences " +
-                    "to set autohide to " + autohide);
-            }
 
-            private static void RunAppleScript(string script)
-            {
                 try
                 {
-                    var info = new System.Diagnostics.ProcessStartInfo(
-                        "osascript", "-e \"" + script + "\"")
+                    var arguments = "-e \"tell application \\\"System Events\\\" to tell " +
+                                    "dock preferences to set autohide to " + autohide + "\"";
+
+                    var info = new System.Diagnostics.ProcessStartInfo("osascript", arguments)
                     {
                         UseShellExecute = false,
                         CreateNoWindow = true
                     };
+
                     System.Diagnostics.Process.Start(info);
                 }
                 catch (Exception e)
                 {
-                    Debug.LogWarning("[FullscreenGameView] AppleScript call failed: " + e.Message);
+                    Debug.LogWarning("[FullscreenGameView] Could not toggle the Dock: " + e.Message);
                 }
             }
 
@@ -442,6 +620,7 @@ namespace FullscreenGameViewTool
                         UseShellExecute = false,
                         CreateNoWindow = true
                     };
+
                     System.Diagnostics.Process.Start(info);
                 }
                 catch
