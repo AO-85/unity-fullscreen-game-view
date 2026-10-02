@@ -14,12 +14,15 @@ namespace FullscreenGameViewTool
     {
         private const string ToggleMenuPath = "Window/Toggle Fullscreen Game View";
         private const string RestoreMenuPath = "Window/Force Restore (Fullscreen Game View)";
+        private const string DebugMenuPath = "Window/Fullscreen Game View Debug Log";
 
         private const string WindowMarker = "FullscreenGameView.Instance";
         private const string ActiveKey = "FullscreenGameView.Active";
         private const string RectKey = "FullscreenGameView.Rect";
+        private const string DebugKey = "FullscreenGameView.DebugLog";
+        private const string SessionOpenKey = "FullscreenGameView.SessionOpen";
 
-        private const float RectTolerance = 4f;
+        private const float RectTolerance = 6f;
         private const double WatchdogInterval = 0.3;
         private const double WatchdogGrace = 2.0;
 
@@ -29,17 +32,76 @@ namespace FullscreenGameViewTool
         private static readonly PropertyInfo ShowToolbarProperty = FindShowToolbarProperty();
         private static readonly FieldInfo ShowToolbarField = FindShowToolbarField();
 
+        private static readonly FieldInfo HostViewField = typeof(EditorWindow).GetField(
+            "m_Parent", BindingFlags.Instance | BindingFlags.NonPublic);
+
+        private const int ShowModePopupMenu = 1;
+
         private static double _lastToggleTime;
         private static bool _togglePending;
         private static IntPtr _editorWindowBefore = IntPtr.Zero;
         private static double _lastWatchdogRun;
         private static double _missingSince = -1;
+        private static bool _seenAliveSinceReload;
+        private static bool _reopenAttempted;
 
         [MenuItem(ToggleMenuPath, false, 1)]
         public static void ToggleFromMenu() => RequestToggle();
 
         [MenuItem(RestoreMenuPath, false, 2)]
         public static void ForceRestoreFromMenu() => ForceRestore();
+
+        [MenuItem(DebugMenuPath, false, 3)]
+        private static void ToggleDebugLogging()
+        {
+            var value = !EditorPrefs.GetBool(DebugKey, false);
+            EditorPrefs.SetBool(DebugKey, value);
+            Menu.SetChecked(DebugMenuPath, value);
+
+            Debug.Log("[FullscreenGameView] Debug logging " + (value ? "enabled" : "disabled") +
+                      "\n" + BuildDiagnostics());
+        }
+
+        private static string BuildDiagnostics()
+        {
+            var report = "Unity " + Application.unityVersion +
+                         "\nGameView type: " + (GameViewType != null ? GameViewType.FullName : "NOT FOUND") +
+                         "\nshowToolbar accessor: " + DescribeToolbarAccessor() +
+                         "\nm_Parent accessor: " + (HostViewField != null ? "found" : "NOT FOUND") +
+                         "\nEditor pixelsPerPoint: " + EditorGUIUtility.pixelsPerPoint +
+                         "\nScreen.currentResolution: " + Screen.currentResolution.width +
+                         "x" + Screen.currentResolution.height +
+                         "\nActive flag: " + EditorPrefs.GetBool(ActiveKey, false) +
+                         "\nStored rect: " + EditorPrefs.GetString(RectKey, "none") +
+                         "\nPlaying: " + EditorApplication.isPlaying;
+
+            foreach (var monitor in Platform.GetAllMonitorBounds())
+                report += "\nMonitor bounds: " + monitor;
+
+            if (GameViewType == null)
+                return report;
+
+            foreach (var candidate in Resources.FindObjectsOfTypeAll<EditorWindow>())
+            {
+                if (candidate == null || candidate.GetType() != GameViewType)
+                    continue;
+
+                report += "\nGameView: position " + candidate.position +
+                          ", popup " + IsPopupWindow(candidate) +
+                          ", title '" + (candidate.titleContent != null
+                              ? candidate.titleContent.text
+                              : "null") + "'";
+            }
+
+            return report;
+        }
+
+        [MenuItem(DebugMenuPath, true)]
+        private static bool ToggleDebugLoggingValidate()
+        {
+            Menu.SetChecked(DebugMenuPath, EditorPrefs.GetBool(DebugKey, false));
+            return true;
+        }
 
         [Shortcut("Window/Toggle Fullscreen Game View", KeyCode.F11)]
         private static void ToggleFromShortcut() => RequestToggle();
@@ -65,14 +127,32 @@ namespace FullscreenGameViewTool
         {
             var windows = FindFullscreenWindows();
 
+            Log("Toggle: found " + windows.Count + " window(s), active flag = " +
+                EditorPrefs.GetBool(ActiveKey, false) + ", playing = " + EditorApplication.isPlaying);
+
             if (windows.Count > 0)
+            {
                 CloseFullscreen(windows);
-            else
-                OpenFullscreen();
+                return;
+            }
+
+            if (EditorPrefs.GetBool(ActiveKey, false))
+            {
+                Log("Active flag was set but no window exists, treating this as an exit.");
+
+                Platform.ClearTopmost();
+                Cleanup();
+                Platform.RestoreEditorFocus(_editorWindowBefore);
+                _editorWindowBefore = IntPtr.Zero;
+                return;
+            }
+
+            OpenFullscreen();
         }
 
         public static void ForceRestore()
         {
+            Log("ForceRestore requested.");
             CloseFullscreen(FindFullscreenWindows());
         }
 
@@ -87,30 +167,38 @@ namespace FullscreenGameViewTool
 
             var bounds = Platform.GetFullscreenBounds();
 
-            _editorWindowBefore = Platform.GetForegroundWindowHandle();
+            if (_editorWindowBefore == IntPtr.Zero)
+                _editorWindowBefore = Platform.GetForegroundWindowHandle();
+
+            Platform.SetTaskbarVisible(false);
 
             var window = (EditorWindow)ScriptableObject.CreateInstance(GameViewType);
 
             SetShowToolbar(window, false);
 
             window.ShowPopup();
-            window.position = bounds;
+            window.position = ToEditorPoints(bounds);
             window.Focus();
 
             ApplyIdentity(window);
 
             EditorPrefs.SetBool(ActiveKey, true);
+            SessionState.SetBool(SessionOpenKey, true);
             SaveRect(window.position);
 
-            Platform.SetTaskbarVisible(false);
-
             _missingSince = -1;
+            _seenAliveSinceReload = true;
+
+            Log("Opened. Monitor " + bounds + ", pixelsPerPoint " + EditorGUIUtility.pixelsPerPoint +
+                ", requested " + ToEditorPoints(bounds) + ", actual " + window.position);
 
             BeginTopmostRetry(bounds, _editorWindowBefore);
         }
 
         private static void CloseFullscreen(List<EditorWindow> windows)
         {
+            Log("Closing " + windows.Count + " window(s).");
+
             Platform.ClearTopmost();
 
             foreach (var window in windows)
@@ -119,15 +207,23 @@ namespace FullscreenGameViewTool
                     window.Close();
             }
 
+            Cleanup();
+
+            Platform.RestoreEditorFocus(_editorWindowBefore);
+            _editorWindowBefore = IntPtr.Zero;
+        }
+
+        private static void Cleanup()
+        {
             Platform.SetTaskbarVisible(true);
 
             EditorPrefs.SetBool(ActiveKey, false);
             EditorPrefs.DeleteKey(RectKey);
+            SessionState.EraseBool(SessionOpenKey);
 
             _missingSince = -1;
-
-            Platform.RestoreEditorFocus(_editorWindowBefore);
-            _editorWindowBefore = IntPtr.Zero;
+            _seenAliveSinceReload = false;
+            _reopenAttempted = false;
         }
 
         private static List<EditorWindow> FindFullscreenWindows()
@@ -140,27 +236,92 @@ namespace FullscreenGameViewTool
             var storedRect = default(Rect);
             var active = EditorPrefs.GetBool(ActiveKey, false);
             var hasStoredRect = active && TryLoadRect(out storedRect);
+            var monitors = active ? Platform.GetAllMonitorBounds() : null;
 
             foreach (var candidate in Resources.FindObjectsOfTypeAll<EditorWindow>())
             {
                 if (candidate == null || candidate.GetType() != GameViewType)
                     continue;
 
+                var position = candidate.position;
+
                 var marked = candidate.titleContent != null &&
                              candidate.titleContent.text == WindowMarker;
 
-                var matchesRect = hasStoredRect && RectsMatch(candidate.position, storedRect);
+                var isPopup = IsPopupWindow(candidate);
+                var matchesStored = hasStoredRect && RectsMatch(position, storedRect);
+                var matchesMonitor = monitors != null && CoversWholeMonitor(position, monitors);
 
-                if (!marked && !matchesRect)
+                if (!marked && !isPopup && !matchesStored && !matchesMonitor)
                     continue;
 
                 if (!marked)
+                {
+                    Log("Re-identified window at " + position +
+                        " (popup: " + isPopup +
+                        ", stored match: " + matchesStored +
+                        ", monitor match: " + matchesMonitor + ").");
+
                     ApplyIdentity(candidate);
+                    SaveRect(position);
+                }
 
                 found.Add(candidate);
             }
 
             return found;
+        }
+
+        private static Rect ToEditorPoints(Rect physical)
+        {
+            var scale = EditorGUIUtility.pixelsPerPoint;
+
+            if (scale <= 0f || float.IsNaN(scale) || float.IsInfinity(scale))
+                scale = 1f;
+
+            return new Rect(physical.x / scale, physical.y / scale,
+                physical.width / scale, physical.height / scale);
+        }
+
+        private static bool IsPopupWindow(EditorWindow window)
+        {
+            try
+            {
+                var hostView = HostViewField?.GetValue(window);
+                if (hostView == null)
+                    return false;
+
+                var containerProperty = hostView.GetType().GetProperty("window",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+                var container = containerProperty?.GetValue(hostView);
+                if (container == null)
+                    return false;
+
+                var showModeProperty = container.GetType().GetProperty("showMode",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+                var showMode = showModeProperty?.GetValue(container);
+                if (showMode == null)
+                    return false;
+
+                return Convert.ToInt32(showMode) == ShowModePopupMenu;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool CoversWholeMonitor(Rect position, List<Rect> monitors)
+        {
+            foreach (var monitor in monitors)
+            {
+                if (RectsMatch(position, monitor))
+                    return true;
+            }
+
+            return false;
         }
 
         private static void ApplyIdentity(EditorWindow window)
@@ -186,6 +347,17 @@ namespace FullscreenGameViewTool
 
             Debug.LogWarning("[FullscreenGameView] Could not hide the Game View toolbar " +
                              "on this Unity version. Everything else still works.");
+        }
+
+        private static string DescribeToolbarAccessor()
+        {
+            if (ShowToolbarProperty != null)
+                return "property on " + ShowToolbarProperty.DeclaringType.Name;
+
+            if (ShowToolbarField != null)
+                return "field " + ShowToolbarField.Name + " on " + ShowToolbarField.DeclaringType.Name;
+
+            return "NOT FOUND";
         }
 
         private static PropertyInfo FindShowToolbarProperty()
@@ -340,28 +512,44 @@ namespace FullscreenGameViewTool
             if (FindFullscreenWindows().Count > 0)
             {
                 _missingSince = -1;
+                _seenAliveSinceReload = true;
+                return;
+            }
+
+            if (SessionState.GetBool(SessionOpenKey, false) &&
+                !_seenAliveSinceReload &&
+                !_reopenAttempted)
+            {
+                _reopenAttempted = true;
+
+                Log("Watchdog: window did not survive the domain reload, reopening.");
+                OpenFullscreen();
                 return;
             }
 
             if (_missingSince < 0)
             {
                 _missingSince = now;
+                Log("Watchdog: window missing, starting grace period.");
                 return;
             }
 
             if (now - _missingSince < WatchdogGrace)
                 return;
 
+            Log("Watchdog: window still missing after grace period, restoring taskbar.");
+
             Platform.ClearTopmost();
-            Platform.SetTaskbarVisible(true);
-
-            EditorPrefs.SetBool(ActiveKey, false);
-            EditorPrefs.DeleteKey(RectKey);
-
-            _missingSince = -1;
+            Cleanup();
 
             Platform.RestoreEditorFocus(_editorWindowBefore);
             _editorWindowBefore = IntPtr.Zero;
+        }
+
+        private static void Log(string message)
+        {
+            if (EditorPrefs.GetBool(DebugKey, false))
+                Debug.Log("[FullscreenGameView] " + message);
         }
 
         [InitializeOnLoadMethod]
@@ -377,6 +565,13 @@ namespace FullscreenGameViewTool
 
             _lastWatchdogRun = 0;
             _missingSince = -1;
+            _seenAliveSinceReload = false;
+            _reopenAttempted = false;
+
+            Log("Domain reload. Active flag = " + EditorPrefs.GetBool(ActiveKey, false) +
+                ", session open = " + SessionState.GetBool(SessionOpenKey, false) +
+                ", stored rect = " + EditorPrefs.GetString(RectKey, "none") +
+                ", playing = " + EditorApplication.isPlaying);
         }
 
         private static class Platform
@@ -407,6 +602,9 @@ namespace FullscreenGameViewTool
                 public RECT rcWork;
                 public uint dwFlags;
             }
+
+            private delegate bool MonitorEnumProc(IntPtr monitor, IntPtr hdc,
+                ref RECT rect, IntPtr data);
 
             [DllImport("user32.dll")]
             private static extern IntPtr FindWindow(string className, string windowName);
@@ -441,7 +639,11 @@ namespace FullscreenGameViewTool
             private static extern IntPtr MonitorFromPoint(POINT point, uint flags);
 
             [DllImport("user32.dll", CharSet = CharSet.Auto)]
-            private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO info);
+            private static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
+
+            [DllImport("user32.dll")]
+            private static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr clip,
+                MonitorEnumProc callback, IntPtr data);
 
             private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
             private static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
@@ -454,6 +656,33 @@ namespace FullscreenGameViewTool
             private static IntPtr _fullscreenHwnd = IntPtr.Zero;
 
             public static IntPtr GetForegroundWindowHandle() => GetForegroundWindow();
+
+            public static List<Rect> GetAllMonitorBounds()
+            {
+                var result = new List<Rect>();
+
+                MonitorEnumProc callback = (IntPtr monitor, IntPtr hdc, ref RECT rect, IntPtr data) =>
+                {
+                    var info = new MONITORINFO { cbSize = Marshal.SizeOf(typeof(MONITORINFO)) };
+
+                    if (GetMonitorInfo(monitor, ref info))
+                    {
+                        var r = info.rcMonitor;
+                        result.Add(new Rect(r.left, r.top, r.right - r.left, r.bottom - r.top));
+                    }
+
+                    return true;
+                };
+
+                if (!EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, callback, IntPtr.Zero) ||
+                    result.Count == 0)
+                {
+                    var res = Screen.currentResolution;
+                    result.Add(new Rect(0, 0, res.width, res.height));
+                }
+
+                return result;
+            }
 
             public static Rect GetFullscreenBounds()
             {
@@ -548,6 +777,12 @@ namespace FullscreenGameViewTool
 
             public static IntPtr GetForegroundWindowHandle() => IntPtr.Zero;
 
+            public static List<Rect> GetAllMonitorBounds()
+            {
+                var res = Screen.currentResolution;
+                return new List<Rect> { new Rect(0, 0, res.width, res.height) };
+            }
+
             public static Rect GetFullscreenBounds()
             {
                 var res = Screen.currentResolution;
@@ -586,6 +821,12 @@ namespace FullscreenGameViewTool
 #else
 
             public static IntPtr GetForegroundWindowHandle() => IntPtr.Zero;
+
+            public static List<Rect> GetAllMonitorBounds()
+            {
+                var res = Screen.currentResolution;
+                return new List<Rect> { new Rect(0, 0, res.width, res.height) };
+            }
 
             public static Rect GetFullscreenBounds()
             {
